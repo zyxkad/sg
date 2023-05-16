@@ -1,18 +1,26 @@
 # Copyright (C) 2023 zyxkad@gmail.com
 
 import abc
+import bisect
 import math
+import os
 import random
-from typing import Any
+import time
+from typing import Any, Self
 
 import pygame
+import numpy
 import tensorflow
+from tensorflow import keras
+from tensorflow.keras import layers
 
 from ag import *
 
 __all__ = [
 	'main'
 ]
+
+EPS = numpy.finfo(numpy.float32).eps.item()
 
 def random_chose(weights: list[tuple[Any, float]]) -> Any:
 	assert len(weights) > 0
@@ -90,6 +98,7 @@ class Snake(abc.ABC, Node):
 		self.nodes = [(self.hx, self.hy, self.angle) for i in range(self.node_step * cls.init_nodes)]
 		self._name = name
 		self.body_color = body_color
+		self._dead = False
 
 	@property
 	def hpos(self) -> Vec2:
@@ -122,7 +131,7 @@ class Snake(abc.ABC, Node):
 	def speed_active(self) -> bool:
 		raise NotImplementedError()
 
-	def reset(self, x: int, y: int, angle: int):
+	def reset(self, x: int, y: int, angle: int) -> Self:
 		cls = self.__class__
 		self.isize = 16
 		self.hx = x
@@ -134,6 +143,7 @@ class Snake(abc.ABC, Node):
 		self._last_score = 0
 		self._last_score2 = 50
 		self.nodes = [(self.hx, self.hy, self.angle) for i in range(self.node_step * cls.init_nodes)]
+		self._dead = False
 		return self
 
 	def move(self, dx: float, dy: float):
@@ -225,42 +235,47 @@ class Player(Snake):
 		if abs(self.hy - self.d.camera.y) >= self.camera_follow_y:
 			self.d.camera.y += dy
 
-	def reset(self, x: int, y: int, angle: int):
+	def reset(self, x: int, y: int, angle: int) -> Self:
 		self.d.camera.x = x
 		self.d.camera.y = y
 		return super().reset(x, y, angle)
 
-######## BEGIN model ########
+def newSnakeModel():
+	inputs = keras.Input(shape=(9 + 6 * 50 + 4 * 20,))
+	d1 = layers.Dense(256, activation='relu')(inputs)
+	d2 = layers.Dense(97, activation='relu')(d1)
+	# 6 status [left keep right] * [slow fast]
+	action = layers.Dense(8, activation='softmax')(d2)
+	critic = layers.Dense(1)(d2)
+	return keras.Model(inputs=inputs, outputs=[action, critic])
 
-# class SnakeModel(Model):
-#   def __init__(self):
-#     super().__init__()
-#     self.conv1 = Conv2D(32, 3, activation='relu')
-#     self.flatten = Flatten()
-#     self.d1 = Dense(128, activation='relu')
-#     self.d2 = Dense(10)
-
-#   def call(self, x):
-#     x = self.conv1(x)
-#     x = self.flatten(x)
-#     x = self.d1(x)
-#     return self.d2(x)
-
-# # Create an instance of the model
-# model = SnakeModel()
-
-######## END model ########
+# class SnakeModel:
+# 	def __init__(self):
+# 		inputs = keras.Input(shape=(9 + 6 * 50 + 4 * 20,))
+# 		d1 = layers.Dense(256, activation='relu')(inputs)
+# 		d2 = layers.Dense(97, activation='relu')(d1)
+# 		# 6 status [left forward right] * [slow fast]
+# 		action = layers.Dense(8, activation='softmax')(d2)
+# 		critic = layers.Dense(1)(d2)
+# 		self.model =  keras.Model(inputs=inputs, outputs=[action, critic])
 
 class BotSnake(Snake):
+	model = newSnakeModel()
+
 	def __init__(self, x: int, y: int, angle: int, name: str, body_color: Color):
 		super().__init__(x, y, angle, name, body_color)
 		self._left_active = False
-		self._right_active = not False
+		self._right_active = False
 		self._speed_active = False
+		self._snodes = []
+		self._sfoods = []
+		self._lasta = 0
+		self._last_kill_count = 0
+		self._last_gain_score = time.time()
 
 	@property
 	def left_active(self) -> bool:
-		return self._left_active or random.randint(0, 1) == 0
+		return self._left_active
 
 	@property
 	def right_active(self) -> bool:
@@ -268,9 +283,24 @@ class BotSnake(Snake):
 
 	@property
 	def speed_active(self) -> bool:
-		return self._speed_active or random.randint(0, 1) == 0
+		return self._speed_active
+
+	def reset(self, x: int, y: int, angle: int) -> Self:
+		super().reset(x, y, angle)
+		self._left_active = False
+		self._right_active = False
+		self._speed_active = False
+		self._snodes = []
+		self._sfoods = []
+		self._lasta = 0
+		self._last_kill_count = 0
+		self._last_gain_score = time.time()
+		return self
 
 class PlayLayer(Layer):
+	optimizer = keras.optimizers.Adam(learning_rate=0.01)
+	huber_loss = keras.losses.Huber()
+
 	def __init__(self, bwidth: int, bheight: int, size: int):
 		super().__init__()
 		self.d = Director()
@@ -283,8 +313,8 @@ class PlayLayer(Layer):
 		self.snakes = []
 		rp = self.random_pos()
 		self.player = Player(int(rp.x), int(rp.y), int(random.random() * 4) * 90, 'Player', Colors.blue)
-		self.add_snake(self.player)
-		for i in range(9):
+		# self.add_snake(self.player)
+		for i in range(2):
 			rp = self.random_pos()
 			s = BotSnake(
 				int(rp.x), int(rp.y),
@@ -292,9 +322,10 @@ class PlayLayer(Layer):
 				f'Bot_{i}',
 				Color(random.randint(0, 0xff), random.randint(0, 0xff), random.randint(0, 0xff)))
 			self.add_snake(s)
+		self._watching = 'Bot_0'
 
 		self.foods = []
-		init_food_count = self.bwidth * self.bheight // 5 # 1/5 foods per square
+		init_food_count = self.bwidth * self.bheight // 10
 		for _ in range(init_food_count):
 			self.make_food()
 
@@ -348,41 +379,105 @@ class PlayLayer(Layer):
 	def on_update(self, dt: float):
 		snakes = self.snakes.copy()
 		for s in snakes:
-			s.on_update(dt)
-			spos = s.hpos
-			for f in self.foods.copy():
-				if spos.in_range(f.pos, (self.isize + f.isize) / 2):
-					s._score += f.score
-					self.remove_food(f)
-			dead = s.hx < (-self.width + s.isize) // 2 or \
-				 s.hx > (self.width - s.isize) // 2 or \
-				 s.hy < (-self.height + s.isize) // 2 or \
-				 s.hy > (self.height - s.isize) // 2
-			for s2 in snakes:
-				if dead:
-					break
-				if s2 is not s:
-					for x, y, _ in s2.nodes[:-s2.node_step]:
-						if spos.in_range(Vec2(x, y), (s.isize + s2.isize) // 2):
-							s2.kill_count += 1
-							dead = True
-							break
-			if dead:
-				score_remain = s.score + 10
-				node_per_score = 10
-				avg_score = score_remain * node_per_score // len(s.nodes)
+			isbot = isinstance(s, BotSnake)
+			if self._watching == s.name:
+				self.d.camera.x = s.hx
+				self.d.camera.y = s.hy
+			with tensorflow.GradientTape() as tape:
+				if isbot:
+					score = 0
+					inl = [
+							int(dt // 0.2),
+							s.hx / self.width, s.hy / self.height, s.angle / 360,
+							s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
+					for o in s._snodes[:50]:
+						inl.extend(o[1:])
+					inl.extend([0] * 6 * max(0, 50 - len(s._sfoods)))
+					for o in s._sfoods[:20]:
+						inl.extend(s._sfoods[i][1:])
+					inl.extend([0] * 4 * max(0, 20 - len(s._sfoods)))
 
-				for x, y, _ in (s.nodes[i] for i in range(0, len(s.nodes), node_per_score)):
-					self.add_food(Food(
-						x + (random.random() - 0.5) * 10,
-						y + (random.random() - 0.5) * 10,
-						max(math.sqrt(avg_score), s.isize), avg_score, s.body_color,
-						isdeadbody=True))
-				self.remove_snake(s)
-				if s is self.player:
-					self.on_player_dead()
-				else:
-					self.on_bot_dead(s)
+					inp = numpy.float32(inl).reshape((1, len(inl)))
+					action_probs, critic_value = s.model(inp, training=True)
+					action = numpy.random.choice(8, p=numpy.squeeze(action_probs))
+					if self._watching == s.name:
+						print('action_probs:', bin(action), list(float(p) for p in action_probs[0]), float(critic_value[0, 0]))
+					s._speed_active = bool(action & 1)
+					s._left_active = bool(action & 2)
+					s._right_active = bool(action & 4)
+					if s._lasta != action & 6:
+						score += 1
+						s._lasta = action & 6
+				s.on_update(dt)
+				spos = s.hpos
+				if isbot:
+					now = time.time()
+					score += (-dt if s.speed_active else 0) + -(now - s._last_gain_score) ** 2 / 10 + 1
+					sfoods = []
+					snodes = []
+				for f in self.foods.copy():
+					dis = spos.distance_to2(f.pos)
+					if dis <= ((self.isize + f.isize) // 2) ** 2:
+						s._score += f.score
+						if isbot:
+							score += f.score
+							s._last_gain_score = now
+						self.remove_food(f)
+					elif isbot and dis <= (s.isize * 20) ** 2:
+						bisect.insort(sfoods, (dis, (f.x - s.hx) / self.width, (f.y - s.hy) / self.height, f.isize, 1 if f.isdeadbody else 0), key=lambda n: n[0])
+				dead = s.hx < (-self.width + s.isize) // 2 or \
+					 s.hx > (self.width - s.isize) // 2 or \
+					 s.hy < (-self.height + s.isize) // 2 or \
+					 s.hy > (self.height - s.isize) // 2
+				for s2 in snakes:
+					if dead:
+						break
+					if s2 is not s:
+						for i, (x, y, a) in enumerate(s2.nodes[:-s2.node_step]):
+							p = Vec2(x, y)
+							dis = spos.distance_to2(p)
+							if dis <= ((s.isize + s2.isize) // 2) ** 2:
+								s2.kill_count += 1
+								dead = True
+								break
+							if isbot and dis <= (s.isize * 20) ** 2:
+								if i % s2.node_step == 0:
+									bisect.insort(snodes, (dis, (x - s.hx) / self.width, (y - s.hy) / self.height, 1 if i == 0 else 0, s2.speed, s2.isize, a), key=lambda n: n[0])
+				if dead:
+					score_remain = s.score + 10
+					node_per_score = 10
+					avg_score = score_remain * node_per_score // len(s.nodes)
+
+					for x, y, _ in (s.nodes[i] for i in range(0, len(s.nodes), node_per_score)):
+						self.add_food(Food(
+							x + (random.random() - 0.5) * 10,
+							y + (random.random() - 0.5) * 10,
+							max(math.sqrt(avg_score), s.isize), avg_score, s.body_color,
+							isdeadbody=True))
+					self.remove_snake(s)
+					if s is self.player:
+						self.on_player_dead()
+					else:
+						self.on_bot_dead(s)
+				if isbot:
+					if dead:
+						score -= (s.score + 10) / 5
+					else:
+						s._snodes = snodes
+						s._sfoods = sfoods
+					new_killed = s.kill_count - s._last_kill_count
+					s._last_kill_count = s.kill_count
+					score += new_killed * 5
+
+					critic = critic_value[0, 0]
+					loss_value = \
+						-tensorflow.math.log(action_probs[0, action]) * (critic - score) + \
+						self.huber_loss(tensorflow.expand_dims(critic, 0), tensorflow.expand_dims(score, 0))
+					gradients = tape.gradient(loss_value, s.model.trainable_weights)
+					self.optimizer.apply_gradients(zip(gradients, s.model.trainable_weights))
+					if self._watching == s.name:
+						print(f'loss_value: {loss_value}; score {score:.6f}')
+
 
 	def on_draw(self, surface):
 		surface.fill(self.broad_color)
@@ -453,8 +548,18 @@ class PlayScene(Scene):
 		surface.fill(self.wall_color)
 
 def main():
+	model_target = './snake0.keras'
+	def save_model():
+		print('Saving model to', model_target)
+		BotSnake.model.compile()
+		BotSnake.model.save(model_target)
+	Events.QUIT.register(save_model)
+	if os.path.exists(model_target):
+		print('Loading model from', model_target)
+		BotSnake.model = keras.models.load_model(model_target)
+
 	d = Director()
-	d.init_with_window((1200, 700), 'AG')
+	d.init_with_window((1200, 700), 'Snake Game')
 	winsize = d.winsize
 	ps = PlayScene()
 	d.fps = 60
