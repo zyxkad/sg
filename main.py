@@ -6,6 +6,7 @@ import math
 import os
 import random
 import time
+import threading
 from typing import Any, Self
 
 import pygame
@@ -240,38 +241,149 @@ class Player(Snake):
 		self.d.camera.y = y
 		return super().reset(x, y, angle)
 
+class SnakeModelOut:
+	optimizer = keras.optimizers.legacy.Adam(learning_rate=0.01)
+	huber_loss = keras.losses.Huber()
+	gamma = 0.99
+
+	def __init__(self, model, outs, *, prev=None):
+		self.model = model
+		self.outs = outs
+		self.action_probs = outs[0][0]
+		self.critic = outs[1][0, 0]
+		# print('action_probs:', ' '.join(f'{float(n):.6f}' for n in self.action_probs), flush=False)
+		self.action = numpy.random.choice(len(self.action_probs), p=numpy.squeeze(self.action_probs))
+		self.score = None
+		self.applyed = False
+		self.prev = prev
+
+	def add_score(self, score: float, *, prev: bool = False):
+		if self.score is None:
+			self.score = score
+		else:
+			self.score += score
+		if prev and self.prev is not None and not self.prev.applyed:
+			self.prev.add_score(score, prev=True)
+
+	def apply_gradients(self, tape):
+		assert not self.applyed
+		if self.score is None:
+			return False
+
+		action_probs_history = []
+		critic_value_history = []
+		returns = []
+		discounted_sum = 0
+		n = self
+		while True:
+			if n.score is not None:
+				action_probs_history.append(tensorflow.math.log(n.action_probs[n.action]))
+				critic_value_history.append(n.critic)
+				discounted_sum = n.score + self.gamma * discounted_sum
+				returns.append(discounted_sum)
+			if n.prev is None or n.prev.applyed:
+				n.prev = None
+				break
+			n = n.prev
+		if len(returns) <= 1:
+			return False
+		returns = numpy.array(returns)
+		returns = (returns - numpy.mean(returns)) / (numpy.std(returns) + EPS).tolist()
+
+		loss_value = None
+		c_losses = []
+		for a, c, r in reversed(list(zip(action_probs_history, critic_value_history, returns))):
+			l = a * (c - r)
+			if loss_value is None:
+				loss_value = l
+			else:
+				loss_value += l
+			loss_value += self.huber_loss(tensorflow.expand_dims(c, 0), tensorflow.expand_dims(r, 0))
+		assert loss_value is not None
+
+		with tape.stop_recording():
+			gradients = tape.gradient(loss_value, self.model.trainable_weights)
+			self.optimizer.apply_gradients(zip(gradients, self.model.trainable_weights))
+		self.applyed = True
+		return True
+
 def newSnakeModel():
-	inputs = keras.Input(shape=(9 + 6 * 50 + 4 * 20,))
-	d1 = layers.Dense(256, activation='relu')(inputs)
-	d2 = layers.Dense(97, activation='relu')(d1)
+	size = 8 + 6 * 50 + 4 * 20
+	inputs = keras.Input(shape=(size,))
+	d1 = layers.Dense(size, activation='sigmoid')(inputs)
+	d2 = layers.Dense(97, activation='sigmoid')(d1) # or tanh
 	# 6 status [left keep right] * [slow fast]
-	action = layers.Dense(8, activation='softmax')(d2)
+	action = layers.Dense(6, activation='softmax')(d2)
 	critic = layers.Dense(1)(d2)
 	return keras.Model(inputs=inputs, outputs=[action, critic])
 
-# class SnakeModel:
-# 	def __init__(self):
-# 		inputs = keras.Input(shape=(9 + 6 * 50 + 4 * 20,))
-# 		d1 = layers.Dense(256, activation='relu')(inputs)
-# 		d2 = layers.Dense(97, activation='relu')(d1)
-# 		# 6 status [left forward right] * [slow fast]
-# 		action = layers.Dense(8, activation='softmax')(d2)
-# 		critic = layers.Dense(1)(d2)
-# 		self.model =  keras.Model(inputs=inputs, outputs=[action, critic])
-
-class BotSnake(Snake):
+class SnakeModel:
 	model = newSnakeModel()
 
+	def __init__(self, *, start: bool = False):
+		self.thread = None
+		self.inp = None
+		self.running = False
+
+		if start:
+			self.start()
+
+	@classmethod
+	def compile(cls, *args, **kwargs):
+		return cls.model.compile(*args, **kwargs)
+
+	@classmethod
+	def save(cls, *args, **kwargs):
+		return cls.model.save(*args, **kwargs)
+
+	@classmethod
+	def load_from(cls, path: str):
+		cls.model = keras.models.load_model(path)
+
+	def run(self):
+		tape = tensorflow.GradientTape(persistent=True)
+		while self.running:
+			inp = self.inp
+			if inp is not None:
+				self.inp = None
+				inp, cb, prev = inp
+				with tape:
+					if inp is None:
+						cb(tape)
+					else:
+						out = SnakeModelOut(self.model, self.model(inp, training=True), prev=prev)
+						cb(out, tape)
+			else:
+				time.sleep(0.01)
+
+	def start(self):
+		assert self.thread is None or not self.thread.is_alive()
+		self.thread = threading.Thread(target=self.run, daemon=True)
+		self.running = True
+		self.thread.start()
+
+	def stop(self):
+		self.running = False
+		self.thread.join()
+		self.thread = False
+
+	def set_input(self, inp, callback, prev=None):
+		self.inp = (inp, callback, prev)
+
+class BotSnake(Snake):
 	def __init__(self, x: int, y: int, angle: int, name: str, body_color: Color):
 		super().__init__(x, y, angle, name, body_color)
+		self.model = SnakeModel(start=True)
 		self._left_active = False
 		self._right_active = False
 		self._speed_active = False
 		self._snodes = []
 		self._sfoods = []
-		self._lasta = 0
 		self._last_kill_count = 0
 		self._last_gain_score = time.time()
+		self._ai_outs = None
+		self._last_action = 0
+		self._training = False
 
 	@property
 	def left_active(self) -> bool:
@@ -292,15 +404,35 @@ class BotSnake(Snake):
 		self._speed_active = False
 		self._snodes = []
 		self._sfoods = []
-		self._lasta = 0
 		self._last_kill_count = 0
 		self._last_gain_score = time.time()
+		self._last_action = 0
+		self._training = False
 		return self
 
-class PlayLayer(Layer):
-	optimizer = keras.optimizers.Adam(learning_rate=0.01)
-	huber_loss = keras.losses.Huber()
+	def _apply_gradients(self, tape):
+		if self._ai_outs is None or self._ai_outs.applyed:
+			print('WARN: history not exists or already applyed')
+			return
+		self._training = True
+		self._ai_outs.apply_gradients(tape)
+		self._training = False
 
+	def _set_ai_outs(self, out, tape):
+		self._ai_outs = out
+		self._speed_active = bool(out.action & 1)
+		self._left_active = bool(out.action & 2)
+		self._right_active = bool(out.action & 4)
+		if self._last_action != out.action & 6:
+			out.score = 1
+			self._last_action = out.action
+
+	def _when_dead(self, tape):
+		print('==>  apply gradients due snake dead')
+		self._apply_gradients(tape)
+		print('==>  done for apply gradients')
+
+class PlayLayer(Layer):
 	def __init__(self, bwidth: int, bheight: int, size: int):
 		super().__init__()
 		self.d = Director()
@@ -311,6 +443,7 @@ class PlayLayer(Layer):
 		self.broad_line_color = Color.from_rgb(0.5, 0.5, 0.5)
 
 		self.snakes = []
+		self.training = []
 		rp = self.random_pos()
 		self.player = Player(int(rp.x), int(rp.y), int(random.random() * 4) * 90, 'Player', Colors.blue)
 		# self.add_snake(self.player)
@@ -321,6 +454,7 @@ class PlayLayer(Layer):
 				int(random.random() * 360),
 				f'Bot_{i}',
 				Color(random.randint(0, 0xff), random.randint(0, 0xff), random.randint(0, 0xff)))
+			self.training.append(s)
 			self.add_snake(s)
 		self._watching = 'Bot_0'
 
@@ -370,11 +504,21 @@ class PlayLayer(Layer):
 
 	def on_bot_dead(self, s: Snake):
 		def retrieve():
+			if isinstance(s, BotSnake) and s._training:
+				self.scheduler.add_timeout(retrieve, 0.5)
+				return
+			print('retrieving snake', s.name)
 			rp = self.random_pos()
 			self.add_snake(s.reset(
 				int(rp.x), int(rp.y),
 				int(random.random() * 360)))
 		self.scheduler.add_timeout(retrieve, 3)
+
+	def on_entered(self):
+		super().on_entered()
+
+	def on_exit(self):
+		super().on_entered()
 
 	def on_update(self, dt: float):
 		snakes = self.snakes.copy()
@@ -383,101 +527,92 @@ class PlayLayer(Layer):
 			if self._watching == s.name:
 				self.d.camera.x = s.hx
 				self.d.camera.y = s.hy
-			with tensorflow.GradientTape() as tape:
-				if isbot:
-					score = 0
-					inl = [
-							int(dt // 0.2),
-							s.hx / self.width, s.hy / self.height, s.angle / 360,
-							s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
-					for o in s._snodes[:50]:
-						inl.extend(o[1:])
-					inl.extend([0] * 6 * max(0, 50 - len(s._sfoods)))
-					for o in s._sfoods[:20]:
-						inl.extend(s._sfoods[i][1:])
-					inl.extend([0] * 4 * max(0, 20 - len(s._sfoods)))
-
-					inp = numpy.float32(inl).reshape((1, len(inl)))
-					action_probs, critic_value = s.model(inp, training=True)
-					action = numpy.random.choice(8, p=numpy.squeeze(action_probs))
-					if self._watching == s.name:
-						print('action_probs:', bin(action), list(float(p) for p in action_probs[0]), float(critic_value[0, 0]))
-					s._speed_active = bool(action & 1)
-					s._left_active = bool(action & 2)
-					s._right_active = bool(action & 4)
-					if s._lasta != action & 6:
-						score += 1
-						s._lasta = action & 6
-				s.on_update(dt)
-				spos = s.hpos
-				if isbot:
-					now = time.time()
-					score += (-dt if s.speed_active else 0) + -(now - s._last_gain_score) ** 2 / 10 + 1
-					sfoods = []
-					snodes = []
-				for f in self.foods.copy():
-					dis = spos.distance_to2(f.pos)
-					if dis <= ((self.isize + f.isize) // 2) ** 2:
-						s._score += f.score
-						if isbot:
-							score += f.score
-							s._last_gain_score = now
-						self.remove_food(f)
-					elif isbot and dis <= (s.isize * 20) ** 2:
-						bisect.insort(sfoods, (dis, (f.x - s.hx) / self.width, (f.y - s.hy) / self.height, f.isize, 1 if f.isdeadbody else 0), key=lambda n: n[0])
-				dead = s.hx < (-self.width + s.isize) // 2 or \
-					 s.hx > (self.width - s.isize) // 2 or \
-					 s.hy < (-self.height + s.isize) // 2 or \
-					 s.hy > (self.height - s.isize) // 2
-				for s2 in snakes:
-					if dead:
-						break
-					if s2 is not s:
-						for i, (x, y, a) in enumerate(s2.nodes[:-s2.node_step]):
-							p = Vec2(x, y)
-							dis = spos.distance_to2(p)
-							if dis <= ((s.isize + s2.isize) // 2) ** 2:
-								s2.kill_count += 1
-								dead = True
-								break
-							if isbot and dis <= (s.isize * 20) ** 2:
-								if i % s2.node_step == 0:
-									bisect.insort(snodes, (dis, (x - s.hx) / self.width, (y - s.hy) / self.height, 1 if i == 0 else 0, s2.speed, s2.isize, a), key=lambda n: n[0])
+			if isbot:
+				inl = [
+						s.hx / self.width, s.hy / self.height, (s.angle + 360) % 360 / 360,
+						s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
+				for o in s._snodes[:50]:
+					inl.extend(o[1:])
+				inl.extend([0] * 6 * max(0, 50 - len(s._snodes)))
+				for o in s._sfoods[:20]:
+					inl.extend(o[1:])
+				inl.extend([0] * 4 * max(0, 20 - len(s._sfoods)))
+				inl = tensorflow.convert_to_tensor([inl], dtype=tensorflow.float32)
+				s.model.set_input(inl, s._set_ai_outs, s._ai_outs)
+				out = s._ai_outs
+				isbot = out is not None
+			last_pos = s.hpos
+			s.on_update(dt)
+			spos = s.hpos
+			if isbot:
+				now = time.time()
+				score = (-dt if s.speed_active else 0) - (now - s._last_gain_score) ** 2 / 10 + 1
+				sfoods = []
+				snodes = []
+			for f in self.foods.copy():
+				dis = spos.distance_to2(f.pos)
+				if dis <= ((self.isize + f.isize) // 2) ** 2:
+					s._score += f.score
+					if isbot:
+						score += f.score
+						out.add_score(f.score)
+						s._last_gain_score = now
+					self.remove_food(f)
+				elif isbot and dis <= (s.isize * 20) ** 2:
+					bisect.insort(sfoods, (dis, (f.x - s.hx) / self.width, (f.y - s.hy) / self.height, f.isize, 1 if f.isdeadbody else 0), key=lambda n: n[0])
+			dead = \
+				s.hx < (-self.width + s.isize) // 2 or \
+				s.hx > (self.width - s.isize) // 2 or \
+				s.hy < (-self.height + s.isize) // 2 or \
+				s.hy > (self.height - s.isize) // 2
+			for s2 in snakes:
 				if dead:
-					score_remain = s.score + 10
-					node_per_score = 10
-					avg_score = score_remain * node_per_score // len(s.nodes)
+					break
+				if s2 is not s:
+					for i, (x, y, a) in enumerate(s2.nodes[:-s2.node_step]):
+						p = Vec2(x, y)
+						dis = spos.distance_to2(p)
+						if dis <= ((s.isize + s2.isize) // 2) ** 2:
+							s2.kill_count += 1
+							dead = True
+							break
+						if isbot and dis <= (s.isize * 20) ** 2:
+							if i % s2.node_step == 0:
+								bisect.insort(snodes, (dis, (x - s.hx) / self.width, (y - s.hy) / self.height, 1 if i == 0 else 0, s2.speed, s2.isize, a), key=lambda n: n[0])
 
-					for x, y, _ in (s.nodes[i] for i in range(0, len(s.nodes), node_per_score)):
-						self.add_food(Food(
-							x + (random.random() - 0.5) * 10,
-							y + (random.random() - 0.5) * 10,
-							max(math.sqrt(avg_score), s.isize), avg_score, s.body_color,
-							isdeadbody=True))
-					self.remove_snake(s)
-					if s is self.player:
-						self.on_player_dead()
-					else:
-						self.on_bot_dead(s)
-				if isbot:
-					if dead:
-						score -= (s.score + 10) / 5
-					else:
-						s._snodes = snodes
-						s._sfoods = sfoods
-					new_killed = s.kill_count - s._last_kill_count
-					s._last_kill_count = s.kill_count
-					score += new_killed * 5
+			if isbot:
+				if now > s._last_gain_score + 20: # too long idle
+					print('killed snake due too long with idling')
+					dead = True
+				if dead:
+					s.model.set_input(None, s._when_dead)
+					score -= s.score + 100
+				else:
+					score += s.score / 10
+					s._snodes = snodes
+					s._sfoods = sfoods
+				new_killed = s.kill_count - s._last_kill_count
+				s._last_kill_count = s.kill_count
+				score += new_killed * 5
+				if self._watching == s.name:
+					print('score:', score)
+				out.add_score(score)
+			if dead:
+				score_remain = s.score + 10
+				node_per_score = 10
+				avg_score = score_remain * node_per_score // len(s.nodes)
 
-					critic = critic_value[0, 0]
-					loss_value = \
-						-tensorflow.math.log(action_probs[0, action]) * (critic - score) + \
-						self.huber_loss(tensorflow.expand_dims(critic, 0), tensorflow.expand_dims(score, 0))
-					gradients = tape.gradient(loss_value, s.model.trainable_weights)
-					self.optimizer.apply_gradients(zip(gradients, s.model.trainable_weights))
-					if self._watching == s.name:
-						print(f'loss_value: {loss_value}; score {score:.6f}')
-
+				for x, y, _ in (s.nodes[i] for i in range(0, len(s.nodes), node_per_score)):
+					self.add_food(Food(
+						x + (random.random() - 0.5) * 10,
+						y + (random.random() - 0.5) * 10,
+						max(math.sqrt(avg_score), s.isize), avg_score, s.body_color,
+						isdeadbody=True))
+				self.remove_snake(s)
+				if s is self.player:
+					self.on_player_dead()
+				else:
+					self.on_bot_dead(s)
 
 	def on_draw(self, surface):
 		surface.fill(self.broad_color)
@@ -549,14 +684,19 @@ class PlayScene(Scene):
 
 def main():
 	model_target = './snake0.keras'
+	model_saved = False
 	def save_model():
+		nonlocal model_saved
+		if model_saved:
+			return
+		model_saved = True
 		print('Saving model to', model_target)
-		BotSnake.model.compile()
-		BotSnake.model.save(model_target)
+		SnakeModel.compile()
+		SnakeModel.save(model_target)
 	Events.QUIT.register(save_model)
 	if os.path.exists(model_target):
 		print('Loading model from', model_target)
-		BotSnake.model = keras.models.load_model(model_target)
+		SnakeModel.load_from(model_target)
 
 	d = Director()
 	d.init_with_window((1200, 700), 'Snake Game')
@@ -564,6 +704,7 @@ def main():
 	ps = PlayScene()
 	d.fps = 60
 	d.run_with_scene(ps)
+	save_model()
 
 if __name__ == '__main__':
 	main()
