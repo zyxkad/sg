@@ -16,12 +16,11 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from ag import *
+from .model import ModelCli
 
 __all__ = [
 	'main'
 ]
-
-EPS = numpy.finfo(numpy.float32).eps.item()
 
 def random_chose(weights: list[tuple[Any, float]]) -> Any:
 	assert len(weights) > 0
@@ -79,8 +78,8 @@ class Food(Node):
 		surface.clone_from(ch)
 
 class Snake(abc.ABC, Node):
-	turn_speed = 200
-	init_speed = 100
+	turn_speed = 100
+	init_speed = 50
 	init_nodes = 5
 	speed_up_cost = 2
 
@@ -157,8 +156,8 @@ class Snake(abc.ABC, Node):
 			if self._score >= self.speed_up_cost * dt:
 				self._score -= self.speed_up_cost * dt
 				speed = 2
-		dtn = int(dt * 20)
 		dtf = 0.02
+		dtn = int(dt / dtf)
 		step = self.speed * dtf
 		for _ in range(dtn * speed):
 			if self.left_active:
@@ -241,147 +240,17 @@ class Player(Snake):
 		self.d.camera.y = y
 		return super().reset(x, y, angle)
 
-class SnakeModelOut:
-	optimizer = keras.optimizers.legacy.Adam(learning_rate=0.01)
-	huber_loss = keras.losses.Huber()
-	gamma = 0.99
-
-	def __init__(self, model, outs, *, prev=None):
-		self.model = model
-		self.outs = outs
-		self.action_probs = outs[0][0]
-		self.critic = outs[1][0, 0]
-		# print('action_probs:', ' '.join(f'{float(n):.6f}' for n in self.action_probs), flush=False)
-		self.action = numpy.random.choice(len(self.action_probs), p=numpy.squeeze(self.action_probs))
-		self.score = None
-		self.applyed = False
-		self.prev = prev
-
-	def add_score(self, score: float, *, prev: bool = False):
-		if self.score is None:
-			self.score = score
-		else:
-			self.score += score
-		if prev and self.prev is not None and not self.prev.applyed:
-			self.prev.add_score(score, prev=True)
-
-	def apply_gradients(self, tape):
-		assert not self.applyed
-		if self.score is None:
-			return False
-
-		action_probs_history = []
-		critic_value_history = []
-		returns = []
-		discounted_sum = 0
-		n = self
-		while True:
-			if n.score is not None:
-				action_probs_history.append(tensorflow.math.log(n.action_probs[n.action]))
-				critic_value_history.append(n.critic)
-				discounted_sum = n.score + self.gamma * discounted_sum
-				returns.append(discounted_sum)
-			if n.prev is None or n.prev.applyed:
-				n.prev = None
-				break
-			n = n.prev
-		if len(returns) <= 1:
-			return False
-		returns = numpy.array(returns)
-		returns = (returns - numpy.mean(returns)) / (numpy.std(returns) + EPS).tolist()
-
-		loss_value = None
-		c_losses = []
-		for a, c, r in reversed(list(zip(action_probs_history, critic_value_history, returns))):
-			l = a * (c - r)
-			if loss_value is None:
-				loss_value = l
-			else:
-				loss_value += l
-			loss_value += self.huber_loss(tensorflow.expand_dims(c, 0), tensorflow.expand_dims(r, 0))
-		assert loss_value is not None
-
-		with tape.stop_recording():
-			gradients = tape.gradient(loss_value, self.model.trainable_weights)
-			self.optimizer.apply_gradients(zip(gradients, self.model.trainable_weights))
-		self.applyed = True
-		return True
-
-def newSnakeModel():
-	size = 8 + 6 * 50 + 4 * 20
-	inputs = keras.Input(shape=(size,))
-	d1 = layers.Dense(size, activation='sigmoid')(inputs)
-	d2 = layers.Dense(97, activation='sigmoid')(d1) # or tanh
-	# 6 status [left keep right] * [slow fast]
-	action = layers.Dense(6, activation='softmax')(d2)
-	critic = layers.Dense(1)(d2)
-	return keras.Model(inputs=inputs, outputs=[action, critic])
-
-class SnakeModel:
-	model = newSnakeModel()
-
-	def __init__(self, *, start: bool = False):
-		self.thread = None
-		self.inp = None
-		self.running = False
-
-		if start:
-			self.start()
-
-	@classmethod
-	def compile(cls, *args, **kwargs):
-		return cls.model.compile(*args, **kwargs)
-
-	@classmethod
-	def save(cls, *args, **kwargs):
-		return cls.model.save(*args, **kwargs)
-
-	@classmethod
-	def load_from(cls, path: str):
-		cls.model = keras.models.load_model(path)
-
-	def run(self):
-		tape = tensorflow.GradientTape(persistent=True)
-		while self.running:
-			inp = self.inp
-			if inp is not None:
-				self.inp = None
-				inp, cb, prev = inp
-				with tape:
-					if inp is None:
-						cb(tape)
-					else:
-						out = SnakeModelOut(self.model, self.model(inp, training=True), prev=prev)
-						cb(out, tape)
-			else:
-				time.sleep(0.01)
-
-	def start(self):
-		assert self.thread is None or not self.thread.is_alive()
-		self.thread = threading.Thread(target=self.run, daemon=True)
-		self.running = True
-		self.thread.start()
-
-	def stop(self):
-		self.running = False
-		self.thread.join()
-		self.thread = False
-
-	def set_input(self, inp, callback, prev=None):
-		self.inp = (inp, callback, prev)
-
 class BotSnake(Snake):
+	model = ModelCli()
+
 	def __init__(self, x: int, y: int, angle: int, name: str, body_color: Color):
 		super().__init__(x, y, angle, name, body_color)
-		self.model = SnakeModel(start=True)
+		# self.model = SnakeModel(start=True)
 		self._left_active = False
 		self._right_active = False
 		self._speed_active = False
-		self._snodes = []
-		self._sfoods = []
 		self._last_kill_count = 0
 		self._last_gain_score = time.time()
-		self._ai_outs = None
 		self._last_action = 0
 		self._training = False
 
@@ -402,35 +271,25 @@ class BotSnake(Snake):
 		self._left_active = False
 		self._right_active = False
 		self._speed_active = False
-		self._snodes = []
-		self._sfoods = []
 		self._last_kill_count = 0
 		self._last_gain_score = time.time()
 		self._last_action = 0
 		self._training = False
 		return self
 
-	def _apply_gradients(self, tape):
-		if self._ai_outs is None or self._ai_outs.applyed:
-			print('WARN: history not exists or already applyed')
-			return
+	def _apply_gradients(self):
+		assert not self._training
+		print('--> applying gradients for snake', self.name)
 		self._training = True
-		self._ai_outs.apply_gradients(tape)
-		self._training = False
+		def _apply_cb():
+			self.model.apply_gradients()
+			self._training = False
+		threading.Thread(target=_apply_cb, name='BotSnake-apply_gradients').start()
 
-	def _set_ai_outs(self, out, tape):
-		self._ai_outs = out
-		self._speed_active = bool(out.action & 1)
-		self._left_active = bool(out.action & 2)
-		self._right_active = bool(out.action & 4)
-		if self._last_action != out.action & 6:
-			out.score = 1
-			self._last_action = out.action
-
-	def _when_dead(self, tape):
-		print('==>  apply gradients due snake dead')
-		self._apply_gradients(tape)
-		print('==>  done for apply gradients')
+	def _set_action(self, action: int):
+		self._speed_active = bool(action & 1)
+		self._left_active = bool(action & 2)
+		self._right_active = bool(action & 4)
 
 class PlayLayer(Layer):
 	def __init__(self, bwidth: int, bheight: int, size: int):
@@ -447,7 +306,7 @@ class PlayLayer(Layer):
 		rp = self.random_pos()
 		self.player = Player(int(rp.x), int(rp.y), int(random.random() * 4) * 90, 'Player', Colors.blue)
 		# self.add_snake(self.player)
-		for i in range(2):
+		for i in range(1):
 			rp = self.random_pos()
 			s = BotSnake(
 				int(rp.x), int(rp.y),
@@ -527,20 +386,6 @@ class PlayLayer(Layer):
 			if self._watching == s.name:
 				self.d.camera.x = s.hx
 				self.d.camera.y = s.hy
-			if isbot:
-				inl = [
-						s.hx / self.width, s.hy / self.height, (s.angle + 360) % 360 / 360,
-						s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
-				for o in s._snodes[:50]:
-					inl.extend(o[1:])
-				inl.extend([0] * 6 * max(0, 50 - len(s._snodes)))
-				for o in s._sfoods[:20]:
-					inl.extend(o[1:])
-				inl.extend([0] * 4 * max(0, 20 - len(s._sfoods)))
-				inl = tensorflow.convert_to_tensor([inl], dtype=tensorflow.float32)
-				s.model.set_input(inl, s._set_ai_outs, s._ai_outs)
-				out = s._ai_outs
-				isbot = out is not None
 			last_pos = s.hpos
 			s.on_update(dt)
 			spos = s.hpos
@@ -555,7 +400,6 @@ class PlayLayer(Layer):
 					s._score += f.score
 					if isbot:
 						score += f.score
-						out.add_score(f.score)
 						s._last_gain_score = now
 					self.remove_food(f)
 				elif isbot and dis <= (s.isize * 20) ** 2:
@@ -581,22 +425,32 @@ class PlayLayer(Layer):
 								bisect.insort(snodes, (dis, (x - s.hx) / self.width, (y - s.hy) / self.height, 1 if i == 0 else 0, s2.speed, s2.isize, a), key=lambda n: n[0])
 
 			if isbot:
+				inl = [
+					int(s.left_active), int(s.right_active), int(s.speed_active),
+					s.hx / self.width, s.hy / self.height, (s.angle + 360) % 360 / 360,
+					s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
+				for o in snodes[:50]:
+					inl.extend(o[1:])
+				inl.extend([0] * 6 * max(0, 50 - len(snodes)))
+				for o in sfoods[:20]:
+					inl.extend(o[1:])
+				inl.extend([0] * 4 * max(0, 20 - len(sfoods)))
+				out = s.model.train([inl])
+				s._set_action(out.action)
 				if now > s._last_gain_score + 20: # too long idle
 					print('killed snake due too long with idling')
 					dead = True
 				if dead:
-					s.model.set_input(None, s._when_dead)
+					s._apply_gradients()
 					score -= s.score + 100
 				else:
 					score += s.score / 10
-					s._snodes = snodes
-					s._sfoods = sfoods
 				new_killed = s.kill_count - s._last_kill_count
 				s._last_kill_count = s.kill_count
 				score += new_killed * 5
-				if self._watching == s.name:
-					print('score:', score)
-				out.add_score(score)
+				# if self._watching == s.name:
+				# 	print('score:', score)
+				out.set_reward(score)
 			if dead:
 				score_remain = s.score + 10
 				node_per_score = 10
@@ -683,28 +537,21 @@ class PlayScene(Scene):
 		surface.fill(self.wall_color)
 
 def main():
-	model_target = './snake0.keras'
-	model_saved = False
-	def save_model():
-		nonlocal model_saved
-		if model_saved:
-			return
-		model_saved = True
-		print('Saving model to', model_target)
-		SnakeModel.compile()
-		SnakeModel.save(model_target)
-	Events.QUIT.register(save_model)
-	if os.path.exists(model_target):
-		print('Loading model from', model_target)
-		SnakeModel.load_from(model_target)
-
-	d = Director()
+	d = Director(exit_when_quit=False)
 	d.init_with_window((1200, 700), 'Snake Game')
 	winsize = d.winsize
 	ps = PlayScene()
 	d.fps = 60
 	d.run_with_scene(ps)
-	save_model()
 
-if __name__ == '__main__':
-	main()
+	for s in ps.plyl.snakes:
+		s._apply_gradients()
+
+	done_flag = False
+	while not done_flag:
+		done_flag = True
+		for s in ps.plyl.snakes:
+			if s._training:
+				done_flag = False
+				break
+		time.sleep(0.2)
