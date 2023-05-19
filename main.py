@@ -250,8 +250,10 @@ class BotSnake(Snake):
 		self._right_active = False
 		self._speed_active = False
 		self._last_kill_count = 0
-		self._last_gain_score = time.time()
+		self._last_gain_score = 0
 		self._last_action = 0
+		self._survive_time = 0
+		self._predict_dt = 0
 		self._training = False
 
 	@property
@@ -272,8 +274,10 @@ class BotSnake(Snake):
 		self._right_active = False
 		self._speed_active = False
 		self._last_kill_count = 0
-		self._last_gain_score = time.time()
+		self._last_gain_score = 0
 		self._last_action = 0
+		self._survive_time = 0
+		self._predict_dt = 0
 		self._training = False
 		return self
 
@@ -290,11 +294,16 @@ class BotSnake(Snake):
 		self._speed_active = bool(action & 1)
 		self._left_active = bool(action & 2)
 		self._right_active = bool(action & 4)
+		if self._last_action != action >> 1:
+			self._last_action = action >> 1
+			return True
+		return False
 
 class PlayLayer(Layer):
 	def __init__(self, bwidth: int, bheight: int, size: int):
 		super().__init__()
 		self.d = Director()
+		self.speedX = 4
 		self.bwidth = bwidth
 		self.bheight = bheight
 		self.isize = size
@@ -380,6 +389,8 @@ class PlayLayer(Layer):
 		super().on_entered()
 
 	def on_update(self, dt: float):
+		dt = dt * self.speedX
+
 		snakes = self.snakes.copy()
 		for s in snakes:
 			isbot = isinstance(s, BotSnake)
@@ -390,8 +401,9 @@ class PlayLayer(Layer):
 			s.on_update(dt)
 			spos = s.hpos
 			if isbot:
-				now = time.time()
-				score = (-dt if s.speed_active else 0) - (now - s._last_gain_score) ** 2 / 10 + 1
+				s._survive_time += dt
+				s._last_gain_score += dt
+				score = (-dt * s.speed_up_cost if s.speed_active else 0.5) #- (s._last_gain_score) ** 2 / 10 + 1
 				sfoods = []
 				snodes = []
 			for f in self.foods.copy():
@@ -400,7 +412,7 @@ class PlayLayer(Layer):
 					s._score += f.score
 					if isbot:
 						score += f.score
-						s._last_gain_score = now
+						s._last_gain_score = 0
 					self.remove_food(f)
 				elif isbot and dis <= (s.isize * 20) ** 2:
 					bisect.insort(sfoods, (dis, (f.x - s.hx) / self.width, (f.y - s.hy) / self.height, f.isize, 1 if f.isdeadbody else 0), key=lambda n: n[0])
@@ -425,32 +437,38 @@ class PlayLayer(Layer):
 								bisect.insort(snodes, (dis, (x - s.hx) / self.width, (y - s.hy) / self.height, 1 if i == 0 else 0, s2.speed, s2.isize, a), key=lambda n: n[0])
 
 			if isbot:
-				inl = [
-					int(s.left_active), int(s.right_active), int(s.speed_active),
-					s.hx / self.width, s.hy / self.height, (s.angle + 360) % 360 / 360,
-					s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
-				for o in snodes[:50]:
-					inl.extend(o[1:])
-				inl.extend([0] * 6 * max(0, 50 - len(snodes)))
-				for o in sfoods[:20]:
-					inl.extend(o[1:])
-				inl.extend([0] * 4 * max(0, 20 - len(sfoods)))
-				out = s.model.train([inl])
-				s._set_action(out.action)
-				if now > s._last_gain_score + 20: # too long idle
-					print('killed snake due too long with idling')
-					dead = True
-				if dead:
-					s._apply_gradients()
-					score -= s.score + 100
-				else:
-					score += s.score / 10
-				new_killed = s.kill_count - s._last_kill_count
-				s._last_kill_count = s.kill_count
-				score += new_killed * 5
-				# if self._watching == s.name:
-				# 	print('score:', score)
-				out.set_reward(score)
+				s._predict_dt += dt
+				if s._predict_dt >= 0.2:
+					s._predict_dt = 0
+					inl = [
+						int(s.left_active), int(s.right_active), int(s.speed_active),
+						s.hx / self.width + 1, s.hy / self.height + 1, (s.angle + 360) % 360 / 360,
+						s.speed, s.isize, len(s.nodes), s._score, s.kill_count]
+					for o in snodes[:50]:
+						inl.extend(o[1:])
+					inl.extend([0] * 6 * max(0, 50 - len(snodes)))
+					for o in sfoods[:20]:
+						inl.extend(o[1:])
+					inl.extend([0] * 4 * max(0, 20 - len(sfoods)))
+					out = s.model.train([inl])
+					print('action props:', ', '.join(f'{p:.04f}' for p in out.action_probs))
+					if s._set_action(out.action):
+						score += 0.5
+					if s._last_gain_score > 30: # too long idle
+						print('-> killed snake due too long with idling')
+						dead = True
+					if dead:
+						score -= s.score + 10
+					else:
+						score += s.score / 10
+					new_killed = s.kill_count - s._last_kill_count
+					s._last_kill_count = s.kill_count
+					score += new_killed * 5
+					if self._watching == s.name:
+						print(f'score: {score:04.04f} {out.critic:04.04f}', s._survive_time)
+					out.set_reward(score)
+					if dead:
+						s._apply_gradients()
 			if dead:
 				score_remain = s.score + 10
 				node_per_score = 10

@@ -1,15 +1,31 @@
+# Copyright (C) 2023 zyxkad@gmail.com
 
 import json
+import random
 import sys
 import tensorflow
 
 _ready_mark = '======== READY MARK HERE ========='
 
+def random_chose(weights: list[float]) -> int:
+	total_weight = 0
+	for w in weights:
+		assert w >= 0, f'weight ({w}) must greather or equal than zero'
+		total_weight += w
+	assert total_weight > 0, 'total weight must greather than zero'
+	r = random.random() * total_weight
+	i = 0
+	for j, w in enumerate(weights):
+		i += w
+		if r < i:
+			return j
+	raise RuntimeError('Unexpect statment')
+
 class ModelOutput:
 	def __init__(self, outs):
 		self.action_probs = outs[0][0]
 		self.critic = outs[1][0, 0]
-		self.action = numpy.random.choice(len(self.action_probs), p=numpy.squeeze(self.action_probs))
+		self.action = random_chose([abs(float(w)) for w in self.action_probs])
 		self.reward = None
 		self.applyed = False
 		self.prev = None
@@ -100,7 +116,7 @@ if __name__ != '__main__': # when import as a model
 			with self.lock:
 				self._check_alive()
 				self._stdin.write('g ')
-				json.dump([0 if o.reward is None else o.reward for o in self.outputs], self._stdin)
+				json.dump([o.reward for o in self.outputs], self._stdin)
 				self._stdin.write('\n')
 				self._stdin.flush()
 				l = self._stdout.readline()
@@ -108,7 +124,7 @@ if __name__ != '__main__': # when import as a model
 				self._check_alive()
 				return json.loads(l)
 
-else:
+else: # when run as a program
 	import os
 	import numpy
 	from tensorflow import keras
@@ -123,10 +139,13 @@ else:
 	def newSnakeModel():
 		size = 3 + 8 + 6 * 50 + 4 * 20
 		inputs = keras.Input(shape=(size,))
-		d1 = layers.Dense(size, activation=layers.LeakyReLU(alpha=0.1))(inputs)
-		d2 = layers.Dense(97, activation='sigmoid')(d1)
+		d1 = layers.Dense(size, activation='selu',
+			kernel_initializer='random_normal',
+			bias_initializer='zeros')(inputs)
+		d2 = layers.Dense(256, activation='relu')(d1)
+		d3 = layers.Dense(128, activation='elu')(d2)
 		# 6 status [left keep right] * [slow fast]
-		action = layers.Dense(6, activation='softmax')(d2)
+		action = layers.Dense(6, activation='softmax')(d3)
 		critic = layers.Dense(1)(d2)
 		return keras.Model(inputs=inputs, outputs=[action, critic])
 
@@ -177,12 +196,12 @@ else:
 				obj = json.loads(l)
 				if cmd == 'p': # predict
 					out = ModelOutput(model.predict(tensorflow.convert_to_tensor(obj, dtype=tensorflow.float32)))
-					json.dump(out.serialize(), outputfd, check_circular=False)
+					json.dump(out.serialize(), outputfd)
 					outputfd.write('\n')
 					outputfd.flush()
 				elif cmd == 't': # train
 					out = ModelOutput(model(tensorflow.convert_to_tensor(obj, dtype=tensorflow.float32)))
-					json.dump(out.serialize(), outputfd, check_circular=False)
+					json.dump(out.serialize(), outputfd)
 					outputfd.write('\n')
 					outputfd.flush()
 					action_probs_history.append(tensorflow.math.log(out.action_probs[out.action]))
@@ -192,7 +211,7 @@ else:
 					loss_value = None
 					c_losses = []
 					for a, c, r in zip(action_probs_history, critic_value_history, returns):
-						l = a * (c - r)
+						l = -a * (r - c)
 						if loss_value is None:
 							loss_value = l
 						else:
