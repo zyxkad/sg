@@ -1,0 +1,28 @@
+
+[tool.ruff]
+
+# ignore = [
+# 	"F403",
+# 	"E701",
+# ]
+
+line-length = 100
+
+[tool.mypy]
+
+# ignore_missing_imports = true
+
+[tool.poetry]
+
+mypy_path = ":${MYPY_CONFIG_FILE_DIR}/../ag/"
+name = "sg"
+version = "0.0.0"
+description = "A AI trained Snake Game"
+authors = [
+	"Kevin Z <zyxkad@gmail.com>"
+]
+# readme = "README.MD"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
